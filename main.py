@@ -18,18 +18,21 @@
  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+
+
+import os
+import sys
 import time
 import socket
 import json
 import cv2
-import os
-import sys
 import numpy as np
-import logging as log
-import paho.mqtt.client as mqtt
 
 from argparse import ArgumentParser
 from inference import Network
+
+import logging as log
+import paho.mqtt.client as mqtt
 
 # MQTT server environment variables
 HOSTNAME = socket.gethostname()
@@ -37,7 +40,6 @@ IPADDRESS = socket.gethostbyname(HOSTNAME)
 MQTT_HOST = IPADDRESS
 MQTT_PORT = 3001
 MQTT_KEEPALIVE_INTERVAL = 60
-
 
 
 def build_argparser():
@@ -60,11 +62,10 @@ def build_argparser():
                              "CPU, GPU, FPGA or MYRIAD is acceptable. Sample "
                              "will look for a suitable plugin for device "
                              "specified (CPU by default)")
-    parser.add_argument("-pt", "--prob_threshold", type=float, default=0.5,
+    parser.add_argument("-pt", "--prob_threshold", type=float, default=0.4,
                         help="Probability threshold for detections filtering"
-                        "(0.5 by default)")
+                             "(0.4 by default)")
     return parser
-
 
 
 def connect_mqtt():
@@ -72,7 +73,6 @@ def connect_mqtt():
     client = mqtt.Client()
     client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE_INTERVAL)
     return client
-
 
 
 def infer_on_stream(args, client):
@@ -83,54 +83,54 @@ def infer_on_stream(args, client):
     :param client: MQTT client
     :return: None
     """
+    DEVICE = args.device
+    CPU_EXTENSION = args.cpu_extension
+    
     # Initialise the class
     infer_network = Network()
     # Set Probability threshold for detections
     prob_threshold = args.prob_threshold
     model = args.model
     
-    DEVICE = args.device
-    CPU_EXTENSION = args.cpu_extension
     
     ### TODO: Load the model through `infer_network` ###
     infer_network.load_model(model, CPU_EXTENSION, DEVICE)
     network_shape = infer_network.get_input_shape()
 
     ### TODO: Handle the input stream ###
-    # Checks for live feed
+    # Live feed check
     if args.input == 'CAM':
-        input_validated = 0
+        input_stream = 0
+        single_image_mode = False
 
-    # Checks for input image
+    # Input image check
     elif args.input.endswith('.jpg') or args.input.endswith('.bmp') :
         single_image_mode = True
-        input_validated = args.input
+        input_stream = args.input
 
-    # Checks for video file
+    # Video check
     else:
-        input_validated = args.input
-        assert os.path.isfile(args.input), "file doesn't exist"
+        single_image_mode = False
+        input_stream = args.input
+        assert os.path.isfile(args.input), "File doesn't exist"
 
     ### TODO: Handle the input stream ###
-    cap = cv2.VideoCapture(input_validated)
-    cap.open(input_validated)
+    cap = cv2.VideoCapture(input_stream)
+    cap.open(input_stream)
 
     w = int(cap.get(3))
     h = int(cap.get(4))
 
-    in_shape = network_shape['image_tensor']
-
-    #iniatilize variables
+    # Init variables
     
-    duration_prev = 0
-    counter_total = 0
-    dur = 0
-    request_id=0
+    counter=0
+    total_duration=0
+    req_id=0
     
-    report = 0
-    counter = 0
-    counter_prev = 0
+    entry_time=0
+    leave_time=0
     
+    input_shape = network_shape
     
     ### TODO: Loop until stream is over ###
     while cap.isOpened():
@@ -138,18 +138,17 @@ def infer_on_stream(args, client):
         flag, frame = cap.read()
         if not flag:
             break
-        key_pressed = cv2.waitKey(60)
-        
+
         ### TODO: Pre-process the image as needed ###
-        image = cv2.resize(frame, (in_shape[3], in_shape[2]))
-        image_p = image.transpose((2, 0, 1))
-        image_p = image_p.reshape(1, *image_p.shape)
+        input_image = cv2.resize(frame, (input_shape[3], input_shape[2]))
+        input_image = input_image.transpose((2, 0, 1))
+        input_image = input_image.reshape(1, *input_image.shape)
   
 
         ### TODO: Start asynchronous inference for specified request ###
-        net_input = {'image_tensor': image_p,'image_info': image_p.shape[1:]}
-        duration_report = None
-        infer_network.exec_net(net_input, request_id)
+        net_input = {'image_tensor': input_image, 'image_info': input_image.shape[1:]}
+#         duration_report = None
+        infer_network.exec_net(req_id, net_input)
 
         ### TODO: Wait for the result ###
         if infer_network.wait() == 0:
@@ -159,57 +158,47 @@ def infer_on_stream(args, client):
 
             ### TODO: Extract any desired stats from the results ###
          
-            pointer = 0
+            detected_people = 0
             probs = net_output[0, 0, :, 2]
-            for i, p in enumerate(probs):
-                if p > prob_threshold:
-                    pointer += 1
-                    box = net_output[0, 0, i, 3:]
-                    p1 = (int(box[0] * w), int(box[1] * h))
-                    p2 = (int(box[2] * w), int(box[3] * h))
-                    frame = cv2.rectangle(frame, p1, p2, (0, 255, 0), 3)
-        
-            if pointer != counter:
-                counter_prev = counter
-                counter = pointer
-                if dur >= 3:
-                    duration_prev = dur
-                    dur = 0
-                else:
-                    dur = duration_prev + dur
-                    duration_prev = 0
-            else:
-                dur += 1
-                if dur >= 3:
-                    report = counter
-                    if dur == 3 and counter > counter_prev:
-                        counter_total += counter - counter_prev
-                    elif dur == 3 and counter < counter_prev:
-                        duration_report = int((duration_prev / 10.0) * 1000)
-
+            for i, j in enumerate(probs):
+                if j > prob_threshold:
+                    detected_people += 1
+                    bbox = net_output[0, 0, i, 3:]
+                    j1 = (int(bbox[0] * w), int(bbox[1] * h))
+                    j2 = (int(bbox[2] * w), int(bbox[3] * h))
+                    
+                    frame = cv2.rectangle(frame, j1, j2, (125, 0, 0), 3)
+            
             ### TODO: Calculate and send relevant information on ###
             ### current_count, total_count and duration to the MQTT server ###
             ### Topic "person": keys of "count" and "total" ###
             ### Topic "person/duration": key of "duration" ###
-            client.publish('person',
-                           payload=json.dumps({
-                               'count': report, 'total': counter_total}),
-                           qos=0, retain=False)
-            if duration_report is not None:
-                client.publish('person/duration',
-                               payload=json.dumps({'duration': duration_report}),
-                               qos=0, retain=False)
- 
+            if detected_people > counter:
+                timer_enter = time.time()
+                previous_off = entry_time - leave_time
+                counter = detected_people
+                if previous_off > 10:
+                    total_duration = total_duration  + (detected_people - counter)
+                    client.publish("person", json.dumps({"total": total_duration}))
+                                
+            if detected_people < counter:
+                leave_time = time.time()
+                previous_on = leave_time - entry_time
+                counter = detected_people
+                if previous_on > 10:
+                    client.publish("person/duration", json.dumps({"duration": int(previous_on)}))
+            
+            client.publish("person", json.dumps({"count": counter}))
 
-        ### TODO: Send the frame to the FFMPEG server ###
-        #  Resize the frame
-        frame = cv2.resize(frame, (768, 432))
         sys.stdout.buffer.write(frame)
         sys.stdout.flush()
-
+        
+        ### TODO: Write an output image if `single_image_mode` ###
+        if single_image_mode:
+            cv2.imwrite('output_image.jpg', frame)
+            
     cap.release()
     cv2.destroyAllWindows()
-
 
 
 def main():
@@ -218,6 +207,7 @@ def main():
     :return: None
     """
     # Grab command line args
+    
     args = build_argparser().parse_args()
     # Connect to the MQTT server
     client = connect_mqtt()
